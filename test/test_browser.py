@@ -20,10 +20,11 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.request import urlopen
 
+import common
 from common import BrowserCore, RunnerCore, path_from_root, has_browser, EMTEST_BROWSER, Reporting
 from common import create_file, parameterized, ensure_dir, disabled, test_file, WEBIDL_BINDER
 from common import read_file, also_with_minimal_runtime, EMRUN, no_wasm64, no_2gb, no_4gb
-from common import requires_wasm2js, also_with_wasm2js, parameterize
+from common import requires_wasm2js, also_with_wasm2js, parameterize, find_browser_test_file
 from tools import shared
 from tools import ports
 from tools import utils
@@ -110,6 +111,17 @@ def also_with_proxying(f):
   parameterize(metafunc, {'': (False,),
                           'proxied': (True,)})
   return metafunc
+
+
+def proxied(f):
+  assert callable(f)
+
+  @wraps(f)
+  def decorated(self, *args, **kwargs):
+    self.proxied = True
+    return f(self, *args, **kwargs)
+
+  return decorated
 
 
 # This is similar to @core.no_wasmfs, but it disable WasmFS and runs the test
@@ -235,6 +247,57 @@ class browser(BrowserCore):
     if not is_chrome():
       self.skipTest(f'Current browser ({EMTEST_BROWSER}) does not support JSPI. Only chromium-based browsers ({CHROMIUM_BASED_BROWSERS}) support JSPI today.')
     super(browser, self).require_jspi()
+
+  def post_manual_reftest(self):
+    assert os.path.exists('reftest.js')
+    shutil.copy(test_file('browser_reporting.js'), '.')
+    html = read_file('test.html')
+    html = html.replace('</body>', '''
+<script src="browser_reporting.js"></script>
+<script src="reftest.js"></script>
+<script>
+var windowClose = window.close;
+window.close = () => {
+  // wait for rafs to arrive and the screen to update before reftesting
+  setTimeout(() => {
+    doReftest();
+    setTimeout(windowClose, 5000);
+  }, 1000);
+};
+</script>
+</body>''')
+    create_file('test.html', html)
+
+  def make_reftest(self, expected):
+    # make sure the pngs used here have no color correction, using e.g.
+    #   pngcrush -rem gAMA -rem cHRM -rem iCCP -rem sRGB infile outfile
+    shutil.copy(expected, 'expected.png')
+    create_file('reftest.js', f'''
+      const reftestRebaseline = {common.EMTEST_REBASELINE};
+    ''' + read_file(test_file('reftest.js')))
+
+  def reftest(self, filename, reference, reference_slack=0, *args, **kwargs):
+    """Special case of `btest` that uses reference image
+    """
+    reference = find_browser_test_file(reference)
+    assert 'expected' not in kwargs
+    expected = [str(i) for i in range(0, reference_slack + 1)]
+    self.make_reftest(reference)
+    if self.proxied:
+      assert 'post_build' not in kwargs
+      kwargs['post_build'] = self.post_manual_reftest
+      create_file('fakereftest.js', 'var reftestUnblock = () => {}; var reftestBlock = () => {};')
+      kwargs['args'] += ['--pre-js', 'fakereftest.js']
+    else:
+      kwargs.setdefault('args', [])
+      kwargs['args'] += ['--pre-js', 'reftest.js', '-sGL_TESTING']
+
+    try:
+      return self.btest(filename, expected=expected, *args, **kwargs)
+    finally:
+      if common.EMTEST_REBASELINE and os.path.exists('actual.png'):
+        print(f'overwriting expected image: {reference}')
+        self.run_process('pngcrush -rem gAMA -rem cHRM -rem iCCP -rem sRGB actual.png'.split() + [reference])
 
   def test_sdl1_in_emscripten_nonstrict_mode(self):
     if 'EMCC_STRICT' in os.environ and int(os.environ['EMCC_STRICT']):
@@ -854,27 +917,10 @@ If manually bisecting:
   def test_sdl_canvas(self, args):
     self.btest_exit('test_sdl_canvas.c', args=['-sLEGACY_GL_EMULATION', '-lSDL', '-lGL'] + args)
 
-  def post_manual_reftest(self):
-    assert os.path.exists('reftest.js')
-    html = read_file('test.html')
-    html = html.replace('</body>', '''
-<script src="reftest.js"/>
-<script>
-var windowClose = window.close;
-window.close = () => {
-  // wait for rafs to arrive and the screen to update before reftesting
-  setTimeout(() => {
-    doReftest();
-    setTimeout(windowClose, 5000);
-  }, 1000);
-};
-</script>
-</body>''')
-    create_file('test.html', html)
-
+  @proxied
   def test_sdl_canvas_proxy(self):
     create_file('data.txt', 'datum')
-    self.reftest('test_sdl_canvas_proxy.c', 'test_sdl_canvas_proxy.png', args=['--proxy-to-worker', '--preload-file', 'data.txt', '-lSDL', '-lGL'], post_build=self.post_manual_reftest)
+    self.reftest('test_sdl_canvas_proxy.c', 'test_sdl_canvas_proxy.png', args=['--proxy-to-worker', '--preload-file', 'data.txt', '-lSDL', '-lGL'])
 
   @requires_graphics_hardware
   def test_glgears_proxy_jstarget(self):
@@ -1869,12 +1915,10 @@ simulateKeyUp(100);
   def test_glframebufferattachmentinfo(self):
     self.btest('glframebufferattachmentinfo.c', '1', args=['-lGLESv2', '-lEGL'])
 
-  @no_wasm64('TODO: LEGACY_GL_EMULATION + wasm64')
   @requires_graphics_hardware
   def test_sdl_glshader(self):
     self.reftest('test_sdl_glshader.c', 'test_sdl_glshader.png', args=['-O2', '--closure=1', '-sLEGACY_GL_EMULATION', '-lGL', '-lSDL', '-sGL_ENABLE_GET_PROC_ADDRESS'])
 
-  @no_wasm64('TODO: LEGACY_GL_EMULATION + wasm64')
   @requires_graphics_hardware
   @also_with_proxying
   def test_sdl_glshader2(self):
@@ -1890,7 +1934,7 @@ simulateKeyUp(100);
   })
   @requires_graphics_hardware
   def test_gl_textures(self, args):
-    self.btest_exit('gl_textures.cpp', args=['-lGL', '-g', '-sSTACK_SIZE=1MB'] + args)
+    self.btest_exit('gl_textures.c', args=['-lGL', '-g', '-sSTACK_SIZE=1MB'] + args)
 
   @requires_graphics_hardware
   def test_gl_ps(self):
@@ -2934,7 +2978,7 @@ Module["preRun"] = () => {
     if not self.proxied:
       # closure build current fails on proxying
       self.emcc_args += ['--closure=1', '-g1']
-    self.reftest('test_sdl2_glshader.c', 'test_sdl_glshader.png', args=['-sUSE_SDL=2', '-O2', '-sLEGACY_GL_EMULATION'])
+    self.reftest('test_sdl2_glshader.c', 'test_sdl_glshader.png', args=['-sUSE_SDL=2', '-sLEGACY_GL_EMULATION'])
 
   @requires_graphics_hardware
   def test_sdl2_canvas_blank(self):
@@ -2986,9 +3030,10 @@ Module["preRun"] = () => {
     self.reftest('test_sdl2_image_prepare_data.c', 'screenshot.jpg', args=['--preload-file', 'screenshot.not', '-sUSE_SDL=2', '-sUSE_SDL_IMAGE=2'])
 
   @requires_graphics_hardware
+  @proxied
   def test_sdl2_canvas_proxy(self):
     create_file('data.txt', 'datum')
-    self.reftest('test_sdl2_canvas_proxy.c', 'test_sdl2_canvas.png', args=['-sUSE_SDL=2', '--proxy-to-worker', '--preload-file', 'data.txt'], post_build=self.post_manual_reftest)
+    self.reftest('test_sdl2_canvas_proxy.c', 'test_sdl2_canvas.png', args=['-sUSE_SDL=2', '--proxy-to-worker', '--preload-file', 'data.txt'])
 
   def test_sdl2_pumpevents(self):
     # key events should be detected using SDL_PumpEvents
@@ -3066,8 +3111,9 @@ Module["preRun"] = () => {
     self.btest_exit('test_sdl2_canvas_write.c', args=['-sUSE_SDL=2'])
 
   @requires_graphics_hardware
+  @proxied
   def test_sdl2_gl_frames_swap(self):
-    self.reftest('test_sdl2_gl_frames_swap.c', 'test_sdl2_gl_frames_swap.png', args=['--proxy-to-worker', '-sUSE_SDL=2'], post_build=self.post_manual_reftest)
+    self.reftest('test_sdl2_gl_frames_swap.c', 'test_sdl2_gl_frames_swap.png', args=['--proxy-to-worker', '-sUSE_SDL=2'])
 
   @requires_graphics_hardware
   def test_sdl2_ttf(self):
@@ -4159,7 +4205,7 @@ Module["preRun"] = () => {
   @requires_offscreen_canvas
   @requires_graphics_hardware
   def test_webgl_offscreen_canvas_in_pthread(self, args):
-    self.btest('gl_in_pthread.cpp', expected='1', args=args + ['-pthread', '-sPTHREAD_POOL_SIZE=2', '-sOFFSCREENCANVAS_SUPPORT', '-lGL'])
+    self.btest('gl_in_pthread.c', expected='1', args=args + ['-pthread', '-sPTHREAD_POOL_SIZE=2', '-sOFFSCREENCANVAS_SUPPORT', '-lGL'])
 
   # Tests that it is possible to render WebGL content on a <canvas> on the main
   # thread, after it has once been used to render WebGL content in a pthread
@@ -4174,12 +4220,12 @@ Module["preRun"] = () => {
   @requires_graphics_hardware
   @disabled('This test is disabled because current OffscreenCanvas does not allow transfering it after a rendering context has been created for it.')
   def test_webgl_offscreen_canvas_in_mainthread_after_pthread(self, args):
-    self.btest('gl_in_mainthread_after_pthread.cpp', expected='0', args=args + ['-pthread', '-sPTHREAD_POOL_SIZE=2', '-sOFFSCREENCANVAS_SUPPORT', '-lGL'])
+    self.btest('gl_in_mainthread_after_pthread.c', expected='0', args=args + ['-pthread', '-sPTHREAD_POOL_SIZE=2', '-sOFFSCREENCANVAS_SUPPORT', '-lGL'])
 
   @requires_offscreen_canvas
   @requires_graphics_hardware
   def test_webgl_offscreen_canvas_only_in_pthread(self):
-    self.btest_exit('gl_only_in_pthread.cpp', args=['-pthread', '-sPTHREAD_POOL_SIZE', '-sOFFSCREENCANVAS_SUPPORT', '-lGL', '-sOFFSCREEN_FRAMEBUFFER'])
+    self.btest_exit('gl_only_in_pthread.c', args=['-pthread', '-sPTHREAD_POOL_SIZE', '-sOFFSCREENCANVAS_SUPPORT', '-lGL', '-sOFFSCREEN_FRAMEBUFFER'])
 
   # Tests that rendering from client side memory without default-enabling extensions works.
   @requires_graphics_hardware
@@ -4312,7 +4358,7 @@ Module["preRun"] = () => {
       # given the synchronous render loop here, asyncify is needed to see intermediate frames and
       # the gradual color change
       args += ['-sASYNCIFY', '-DASYNCIFY']
-    self.btest_exit('gl_in_proxy_pthread.cpp', args=args)
+    self.btest_exit('gl_in_proxy_pthread.c', args=args)
 
   @parameterized({
     '': ([],),
